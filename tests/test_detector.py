@@ -1,4 +1,5 @@
 import io
+import csv
 import json
 import os
 import tempfile
@@ -13,12 +14,26 @@ from PIL import Image
 from streamlit.testing.v1 import AppTest
 
 from app import (
+    is_https_url,
+    is_loopback_bind_address,
     media_metadata,
     render_integrity_status,
     render_report,
     scan_email,
     sha256_bytes,
+    sha256_email_input,
     should_run_media_classifier_by_default,
+)
+from scripts.evaluate_labeled_data import evaluate_csv, evaluate_rows
+from scripts.benchmark import analysis_timing_summary, model_execution_status
+from utils.input_safety import (
+    CATEGORY_LIMITS,
+    MIB,
+    UploadValidationError,
+    privacy_safe_report,
+    text_input_size_bytes,
+    validate_upload,
+    validate_upload_size,
 )
 from utils.experimental_models import (
     classify_audio,
@@ -29,6 +44,39 @@ from utils.experimental_models import (
 
 
 class EmailAnalysisTests(unittest.TestCase):
+    def test_synthetic_email_dataset_covers_benign_and_phishing_cases(self):
+        dataset_path = (
+            Path(__file__).parent / 'sample_files' / 'email_classification_cases.csv'
+        )
+        with dataset_path.open(encoding='utf-8', newline='') as dataset_file:
+            rows = list(csv.DictReader(dataset_file))
+
+        self.assertEqual(len(rows), 20)
+        self.assertEqual(
+            {
+                label: sum(row['label'] == label for row in rows)
+                for label in ('benign', 'phishing')
+            },
+            {'benign': 10, 'phishing': 10},
+        )
+        self.assertEqual(
+            {row['source'] for row in rows},
+            {'synthetic'},
+        )
+        self.assertEqual(len({row['id'] for row in rows}), len(rows))
+        self.assertTrue(all(
+            'http://' not in row['body'].lower()
+            and 'https://' not in row['body'].lower()
+            for row in rows
+        ))
+        self.assertTrue(all(None not in row for row in rows))
+
+        for row in rows:
+            with self.subTest(case=row['id']):
+                result = scan_email(row['body'], row['sender'], row['subject'])
+                prediction = 'phishing' if result['risk_score'] >= 35 else 'benign'
+                self.assertEqual(prediction, row['label'], result['findings'])
+
     def test_flags_phishing_indicators_without_opening_links(self):
         result = scan_email(
             'Urgent: verify your password now at http://192.0.2.1/account'
@@ -38,12 +86,50 @@ class EmailAnalysisTests(unittest.TestCase):
         self.assertTrue(result['urls_found'])
         self.assertTrue(any('IP address' in item['indicator'] for item in result['findings']))
         self.assertIn('verify sender', result['limitations'].lower())
+        self.assertIn('Suspicious', result['assessment_status'])
 
     def test_benign_message_is_not_declared_safe(self):
         result = scan_email('Hi, confirming our meeting tomorrow at 2 PM.')
 
         self.assertEqual(result['risk_score'], 0)
         self.assertIn('does not prove', result['findings'][0]['indicator'].lower())
+        self.assertIn('Inconclusive', result['assessment_status'])
+
+    def test_email_report_contains_evidence_timing_and_input_integrity(self):
+        sender = 'analyst@example.org'
+        subject = 'Urgent account notice'
+        body = 'Verify your password immediately.'
+        analysis = scan_email(body, sender, subject)
+        input_hash = sha256_email_input(sender, subject, body)
+        report = {
+            'sender': sender,
+            'subject': subject,
+            'analysis': analysis,
+            'analysis_wall_time_seconds': 0.125,
+            'report_generation_time_seconds': 0.005,
+            'total_processing_time_seconds': 0.130,
+            'sha256_before': input_hash,
+            'sha256_after': sha256_email_input(sender, subject, body),
+            'integrity_verified': True,
+            'integrity_check': (
+                'SHA-256 covers the submitted sender, subject, and body; '
+                'the original text is not included in the downloadable report.'
+            ),
+        }
+
+        downloaded_report = json.loads(render_report(report))
+        self.assertIn('risk_score', downloaded_report['analysis'])
+        self.assertIn('risk_level', downloaded_report['analysis'])
+        self.assertTrue(downloaded_report['analysis']['findings'])
+        self.assertEqual(downloaded_report['analysis_wall_time_seconds'], 0.125)
+        self.assertEqual(downloaded_report['report_generation_time_seconds'], 0.005)
+        self.assertEqual(downloaded_report['total_processing_time_seconds'], 0.130)
+        self.assertEqual(downloaded_report['sha256_before'], input_hash)
+        self.assertEqual(downloaded_report['sha256_after'], input_hash)
+        self.assertTrue(downloaded_report['integrity_verified'])
+        self.assertEqual(downloaded_report['sender'], '[redacted]')
+        self.assertEqual(downloaded_report['subject'], '[redacted]')
+        self.assertNotIn(body, json.dumps(downloaded_report))
 
     def test_malformed_url_does_not_crash_analysis(self):
         result = scan_email('Please review http://[invalid')
@@ -93,6 +179,139 @@ class EmailAnalysisTests(unittest.TestCase):
         self.assertTrue(any('Free email provider' in item['indicator'] for item in actual_free_provider['findings']))
 
 
+class UploadSafetyTests(unittest.TestCase):
+    def test_pasted_email_text_limit_uses_utf8_bytes(self):
+        self.assertEqual(text_input_size_bytes('a' * MIB), MIB)
+        self.assertEqual(text_input_size_bytes('a' * (MIB - 1), 'é'), MIB + 1)
+
+    def test_category_limits_match_the_local_acceptance_targets(self):
+        examples = {
+            'sample.txt': ('text', 1),
+            'sample.png': ('image', 10),
+            'sample.wav': ('audio', 20),
+            'sample.mp4': ('video', 50),
+        }
+        for filename, (category, limit_mib) in examples.items():
+            with self.subTest(filename=filename):
+                limit = CATEGORY_LIMITS[category]
+                self.assertEqual(limit, limit_mib * MIB)
+                self.assertEqual(validate_upload_size(filename, limit), category)
+                with self.assertRaisesRegex(UploadValidationError, 'no larger'):
+                    validate_upload_size(filename, limit + 1)
+
+    def test_rejects_unsupported_extensions_and_invalid_text(self):
+        with self.assertRaisesRegex(UploadValidationError, 'Unsupported file type'):
+            validate_upload(b'content', 'message.exe')
+        with self.assertRaisesRegex(UploadValidationError, 'UTF-8'):
+            validate_upload(b'\xff\xfe', 'message.txt')
+        with self.assertRaisesRegex(UploadValidationError, 'binary data'):
+            validate_upload(b'hello\x00world', 'message.txt')
+
+    def test_rejects_image_extension_and_content_mismatch(self):
+        image_buffer = io.BytesIO()
+        Image.new('RGB', (4, 4), color='white').save(image_buffer, format='JPEG')
+        with self.assertRaisesRegex(UploadValidationError, 'does not match'):
+            validate_upload(image_buffer.getvalue(), 'evidence.png')
+
+    def test_rejects_malformed_image_content(self):
+        with self.assertRaisesRegex(UploadValidationError, 'invalid, truncated'):
+            validate_upload(b'not an image', 'evidence.png')
+
+    def test_rejects_audio_extension_and_content_mismatch(self):
+        with self.assertRaisesRegex(UploadValidationError, 'does not match'):
+            validate_upload(b'not a wave file', 'recording.wav')
+
+    def test_rejects_video_extension_and_content_mismatch(self):
+        with self.assertRaisesRegex(UploadValidationError, 'does not match'):
+            validate_upload(b'not a video file', 'recording.mp4')
+
+    def test_empty_files_are_rejected(self):
+        with self.assertRaisesRegex(UploadValidationError, 'empty'):
+            validate_upload(b'', 'message.txt')
+
+    def test_reports_redact_identifiers_destinations_and_extracted_text(self):
+        report = {
+            'filename': 'private-case-name.png',
+            'email_sender': 'analyst@example.test',
+            'email_subject': 'Confidential account information',
+            'email_analysis': {
+                'urls_found': ['https://private.example.test/path'],
+                'findings': [{'indicator': 'URL contains misleading credentials: https://secret.example.test/'}],
+            },
+            'qr_payloads': ['https://qr.example.test/token'],
+            'ocr': {'text': 'Private OCR content', 'engine': 'test'},
+            'video_inspection_error': 'C:\\Users\\Alice\\private\\frame.png',
+        }
+
+        safe = privacy_safe_report(report)
+        serialized = render_report(report)
+
+        self.assertEqual(safe['filename'], '[uploaded file].png')
+        self.assertEqual(safe['email_analysis']['urls_found']['count'], 1)
+        self.assertEqual(safe['qr_payloads']['count'], 1)
+        self.assertEqual(safe['ocr']['text']['character_count'], len('Private OCR content'))
+        self.assertNotIn('private-case-name', serialized)
+        self.assertNotIn('analyst@example.test', serialized)
+        self.assertNotIn('Confidential account information', serialized)
+        self.assertNotIn('private.example.test', serialized)
+        self.assertNotIn('secret.example.test', serialized)
+        self.assertNotIn('Private OCR content', serialized)
+        self.assertNotIn('C:\\\\Users\\\\Alice', serialized)
+
+
+class LocalRuntimeBoundaryTests(unittest.TestCase):
+    def test_only_loopback_streamlit_addresses_are_accepted(self):
+        for address in ('127.0.0.1', 'localhost', '::1'):
+            with self.subTest(address=address):
+                self.assertTrue(is_loopback_bind_address(address))
+        for address in ('', None, '0.0.0.0', '192.168.1.10', '::'):
+            with self.subTest(address=address):
+                self.assertFalse(is_loopback_bind_address(address))
+
+    def test_public_portal_url_requires_https(self):
+        self.assertTrue(is_https_url('https://chat.example.test'))
+        self.assertFalse(is_https_url('http://chat.example.test'))
+        self.assertFalse(is_https_url('https://'))
+        self.assertFalse(is_https_url('https://['))
+
+
+class EvaluationHarnessTests(unittest.TestCase):
+    def test_computes_confusion_counts_and_binary_metrics_without_samples(self):
+        result = evaluate_rows([
+            {'label': 'phishing', 'prediction': 'phishing', 'message': 'private sample'},
+            {'label': 'benign', 'prediction': 'benign', 'message': 'another private sample'},
+            {'label': 'benign', 'prediction': 'phishing', 'message': 'not emitted'},
+            {'label': 'phishing', 'prediction': 'benign', 'message': 'not emitted'},
+        ])
+
+        self.assertEqual(result['confusion'], {'tp': 1, 'tn': 1, 'fp': 1, 'fn': 1})
+        self.assertEqual(result['metrics'], {
+            'precision': 0.5,
+            'recall': 0.5,
+            'f1': 0.5,
+            'accuracy': 0.5,
+        })
+        self.assertNotIn('private sample', str(result))
+        self.assertIn('does not assess calibration', result['limitations'])
+
+    def test_rejects_invalid_labels_and_empty_datasets(self):
+        with self.assertRaisesRegex(ValueError, 'must be phishing/benign'):
+            evaluate_rows([{'label': 'unknown', 'prediction': 'benign'}])
+        with self.assertRaisesRegex(ValueError, 'no records'):
+            evaluate_rows([])
+
+    def test_csv_evaluation_requires_dataset_license_and_split_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            csv_path = Path(directory) / 'labels.csv'
+            csv_path.write_text('label,prediction\nphishing,phishing\nbenign,benign\n', encoding='utf-8')
+            result = evaluate_csv(csv_path, 'controlled-test', 'authorized', 'held-out test')
+
+        self.assertEqual(result['dataset'], 'controlled-test')
+        self.assertEqual(result['license'], 'authorized')
+        self.assertEqual(result['split'], 'held-out test')
+        self.assertEqual(result['records'], 2)
+
+
 class MediaInspectionTests(unittest.TestCase):
     def test_visual_media_classifier_is_enabled_by_default(self):
         self.assertTrue(should_run_media_classifier_by_default('sample.png'))
@@ -103,6 +322,22 @@ class MediaInspectionTests(unittest.TestCase):
             with self.subTest(filename=audio_filename):
                 self.assertTrue(should_run_media_classifier_by_default(audio_filename))
         self.assertFalse(should_run_media_classifier_by_default('message.eml'))
+
+    def test_benchmark_separates_first_run_from_warm_analysis(self):
+        result = analysis_timing_summary([24.0, 4.0, 16.0], 15)
+
+        self.assertEqual(result['first_run_including_initialization_s'], 24.0)
+        self.assertEqual(result['warm_avg_analysis_time_s'], 10.0)
+        self.assertEqual(result['warm_max_analysis_time_s'], 16.0)
+        self.assertFalse(result['warm_runs_within_target'])
+        self.assertEqual(result['warm_target_seconds'], 15)
+
+    def test_benchmark_does_not_count_classifier_failures_as_completed(self):
+        self.assertEqual(
+            model_execution_status({'deepfake_model_error': 'failed'}, True),
+            'error',
+        )
+        self.assertEqual(model_execution_status({}, False), 'disabled')
 
     def test_image_classifier_result_is_included_in_report(self):
         buffer = io.BytesIO()
@@ -135,7 +370,10 @@ class MediaInspectionTests(unittest.TestCase):
             report = media_metadata(buffer.getvalue(), 'sample.png', run_models=True)
 
         self.assertEqual(report['deepfake_classifier_status'], 'error')
-        self.assertIn('model download interrupted', report['deepfake_model_error'])
+        self.assertEqual(
+            report['deepfake_model_error'],
+            'Optional local image model could not run; details omitted.',
+        )
         self.assertIn('NOT DETERMINED', report['deepfake_result'])
 
     def test_audio_classifier_result_is_included_in_report(self):
@@ -188,7 +426,7 @@ class MediaInspectionTests(unittest.TestCase):
             'limitations': 'test classifier',
             'reported_metrics': {},
         }
-        original = b'unchanged m4a source bytes'
+        original = b'\x00\x00\x00\x18ftypM4A \x00\x00\x02\x00unchanged source'
 
         with (
             patch(
@@ -209,18 +447,14 @@ class MediaInspectionTests(unittest.TestCase):
         self.assertTrue(report['integrity_verified'])
 
     def test_m4a_decode_failure_is_reported(self):
-        original = b'not decodable m4a bytes'
+        original = b'\x00\x00\x00\x18ftypM4A \x00\x00\x02\x00not decodable'
 
         with patch(
             'utils.experimental_models.decode_m4a_audio',
             side_effect=ValueError('unsupported M4A stream'),
         ):
-            report = media_metadata(original, 'sample.m4a', run_models=True)
-
-        self.assertEqual(report['media_type'], 'audio')
-        self.assertEqual(report['deepfake_classifier_status'], 'error')
-        self.assertIn('unsupported M4A stream', report['deepfake_model_error'])
-        self.assertTrue(report['integrity_verified'])
+            with self.assertRaisesRegex(UploadValidationError, 'could not be decoded'):
+                media_metadata(original, 'sample.m4a', run_models=True)
 
     def test_audio_classifier_download_failure_is_reported(self):
         buffer = io.BytesIO()
@@ -234,7 +468,10 @@ class MediaInspectionTests(unittest.TestCase):
             report = media_metadata(buffer.getvalue(), 'sample.wav', run_models=True)
 
         self.assertEqual(report['deepfake_classifier_status'], 'error')
-        self.assertIn('audio model download interrupted', report['deepfake_model_error'])
+        self.assertEqual(
+            report['deepfake_model_error'],
+            'Optional local audio model could not run; details omitted.',
+        )
         self.assertIn('NOT DETERMINED', report['deepfake_result'])
 
     def test_text_file_runs_email_rules_and_preserves_bytes(self):
@@ -281,6 +518,7 @@ class MediaInspectionTests(unittest.TestCase):
 
         self.assertEqual(report['media_type'], 'image')
         self.assertEqual(report['dimensions'], '12 x 8')
+        self.assertEqual(report['mime_type'], 'image/png')
         self.assertTrue(report['integrity_verified'])
         self.assertEqual(report['sha256_before'], report['sha256_after'])
 
@@ -338,6 +576,7 @@ class MediaInspectionTests(unittest.TestCase):
         self.assertEqual(report['sample_rate_hz'], 8000)
         self.assertIn('NOT DETERMINED', report['deepfake_result'])
         self.assertIn('does not prove', report['warning'].lower())
+        self.assertIn('Inconclusive', report['assessment_status'])
 
     def test_flac_ogg_and_aiff_metadata_are_supported(self):
         import numpy as np
@@ -402,7 +641,20 @@ class MediaInspectionTests(unittest.TestCase):
     def test_json_report_is_valid(self):
         report = media_metadata(b'ordinary text', 'message.txt')
 
-        self.assertEqual(json.loads(render_report(report))['filename'], 'message.txt')
+        self.assertEqual(json.loads(render_report(report))['filename'], '[uploaded file].txt')
+
+    def test_downloadable_media_report_includes_risk_evidence_timing_and_hashes(self):
+        source = b'Urgent: verify your password immediately.'
+        report = media_metadata(source, 'message.txt')
+        downloaded_report = json.loads(render_report(report))
+
+        self.assertEqual(downloaded_report['email_analysis']['risk_level'], 'Medium Risk - Suspicious indicators present')
+        self.assertTrue(downloaded_report['email_analysis']['findings'])
+        self.assertEqual(downloaded_report['sha256_before'], sha256_bytes(source))
+        self.assertEqual(downloaded_report['sha256_after'], sha256_bytes(source))
+        self.assertTrue(downloaded_report['integrity_verified'])
+        self.assertGreaterEqual(downloaded_report['analysis_time_seconds'], 0)
+        self.assertNotIn(source.decode(), json.dumps(downloaded_report))
 
 
 class StreamlitUiTests(unittest.TestCase):
@@ -419,22 +671,97 @@ class StreamlitUiTests(unittest.TestCase):
 
     def test_email_screening_renders_a_report(self):
         app_path = Path(__file__).resolve().parents[1] / 'app.py'
+        app = AppTest.from_file(str(app_path), default_timeout=30)
+        app.query_params['session'] = 'test-session'
+        with patch(
+            'urllib.request.urlopen',
+            side_effect=lambda *args, **kwargs: io.BytesIO(
+                b'{"success": true, "username": "test-user"}'
+            ),
+        ):
+            app.run()
+            self.assertFalse(app.exception)
+            self.assertEqual(
+                app.radio(key='dashboard_section').options,
+                ['Overview', 'Email', 'Media', 'Files', 'Chat', 'About'],
+            )
+            self.assertEqual(len(app.file_uploader), 0)
+            app.radio(key='dashboard_section').set_value('Email').run()
+            self.assertFalse(app.exception)
+            checkbox_labels = [checkbox.label for checkbox in app.checkbox]
+            self.assertEqual(len(checkbox_labels), 1)
+            self.assertTrue(any('email classifier' in label for label in checkbox_labels))
+            self.assertTrue(app.checkbox(key='run_email_model').value)
+            app.checkbox(key='run_email_model').set_value(False).run()
+
+            app.text_area(key='email_body').set_value(
+                'Urgent: verify your password immediately at http://192.0.2.1/login'
+            ).run()
+            app.button(key='analyze_email').click().run()
+
+            self.assertFalse(app.exception)
+            self.assertEqual(app.metric[0].value, '53 / 100')
+            self.assertEqual(len(app.download_button), 1)
+            self.assertEqual(app.download_button[0].label, 'Download email report (JSON)')
+            self.assertEqual(len(app.success), 1)
+
+    def test_media_navigation_exposes_audio_image_and_video_categories(self):
+        app_path = Path(__file__).resolve().parents[1] / 'app.py'
+        app = AppTest.from_file(str(app_path), default_timeout=30)
+        app.query_params['session'] = 'test-session'
+        with patch(
+            'urllib.request.urlopen',
+            side_effect=lambda *args, **kwargs: io.BytesIO(
+                b'{"success": true, "username": "test-user"}'
+            ),
+        ):
+            app.run()
+            app.radio(key='dashboard_section').set_value('Media').run()
+            self.assertFalse(app.exception)
+            self.assertEqual(
+                app.radio(key='dashboard_media_category').options,
+                ['Audios', 'Images', 'Videos'],
+            )
+            for category, heading in (
+                ('Audios', 'Inspect audio'),
+                ('Images', 'Inspect image'),
+                ('Videos', 'Inspect video'),
+            ):
+                with self.subTest(category=category):
+                    app.radio(key='dashboard_media_category').set_value(category).run()
+                    self.assertFalse(app.exception)
+                    self.assertTrue(any(heading in item.value for item in app.subheader))
+                    self.assertEqual(len(app.file_uploader), 1)
+
+            app.radio(key='dashboard_section').set_value('Files').run()
+            self.assertFalse(app.exception)
+            self.assertTrue(any('Inspect a file' in item.value for item in app.subheader))
+            self.assertEqual(len(app.file_uploader), 1)
+
+    def test_detector_requires_a_portal_session(self):
+        app_path = Path(__file__).resolve().parents[1] / 'app.py'
         app = AppTest.from_file(str(app_path), default_timeout=30).run()
-        self.assertFalse(app.exception)
-        self.assertEqual(len(app.file_uploader), 1)
-        checkbox_labels = [checkbox.label for checkbox in app.checkbox]
-        self.assertEqual(len(checkbox_labels), 2)
-        self.assertTrue(any('OCR' in label for label in checkbox_labels))
-        self.assertTrue(any('email classifier' in label for label in checkbox_labels))
-
-        app.text_area(key='email_body').set_value(
-            'Urgent: verify your password immediately at http://192.0.2.1/login'
-        ).run()
-        app.button[0].click().run()
 
         self.assertFalse(app.exception)
-        self.assertEqual(app.metric[0].value, '53 / 100')
-        self.assertEqual(len(app.download_button), 1)
+        self.assertEqual(len(app.file_uploader), 0)
+        self.assertTrue(any(
+            'Sign in through the Local-First Threat Analysis app' in item.value
+            for item in app.error
+        ))
+
+    def test_public_deployment_still_requires_a_portal_session(self):
+        app_path = Path(__file__).resolve().parents[1] / 'app.py'
+        with patch.dict(os.environ, {
+            'PUBLIC_DEPLOYMENT': 'true',
+            'PORTAL_CHAT_URL': 'https://chat.example.test',
+        }):
+            app = AppTest.from_file(str(app_path), default_timeout=30).run()
+
+        self.assertFalse(app.exception)
+        self.assertTrue(any(
+            'Sign in through the hosted Threat Analysis app' in item.value
+            for item in app.error
+        ))
 
 
 class OptionalModelHelpersTests(unittest.TestCase):

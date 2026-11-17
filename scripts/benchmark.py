@@ -7,6 +7,7 @@ import os
 import json
 import tempfile
 import wave
+import argparse
 from datetime import datetime, timezone
 import sys
 
@@ -14,18 +15,70 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 try:
-    from app import scan_email, media_metadata, render_report, sha256_bytes
+    from app import (
+        get_email_classifier,
+        media_metadata,
+        render_report,
+        scan_email,
+    )
 except Exception as e:
     print(f'Import error: {e}')
     sys.exit(1)
 
+
+def analysis_timing_summary(analysis_times, target_seconds):
+    if not analysis_times:
+        raise ValueError('At least one analysis timing is required.')
+    if target_seconds <= 0:
+        raise ValueError('The analysis target must be greater than zero.')
+    warm_times = analysis_times[1:]
+    return {
+        'first_run_including_initialization_s': round(analysis_times[0], 6),
+        'warm_avg_analysis_time_s': (
+            round(sum(warm_times) / len(warm_times), 6) if warm_times else None
+        ),
+        'warm_max_analysis_time_s': round(max(warm_times), 6) if warm_times else None,
+        'warm_runs_within_target': (
+            all(elapsed <= target_seconds for elapsed in warm_times) if warm_times else None
+        ),
+        'warm_target_seconds': target_seconds,
+    }
+
+
+def model_execution_status(report, enabled):
+    if not enabled:
+        return 'disabled'
+    if report.get('phishing_model_error') or report.get('deepfake_model_error'):
+        return 'error'
+    if report.get('deepfake_classifier_status') in {'completed', 'error'}:
+        return report['deepfake_classifier_status']
+    if (
+        report.get('experimental_phishing_classification')
+        or report.get('experimental_ai_classification')
+        or report.get('email_analysis', {}).get('ml_classification')
+    ):
+        return 'completed'
+    return 'not applicable'
+
+
 class Benchmark:
-    def __init__(self):
+    def __init__(self, run_ocr=False, run_models=False, analysis_target_seconds=15):
+        if analysis_target_seconds <= 0:
+            raise ValueError('The analysis target must be greater than zero.')
+        self.run_ocr = run_ocr
+        self.run_models = run_models
+        self.analysis_target_seconds = analysis_target_seconds
         self.results = {
             'benchmark_info': {
                 'date': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
                 'tool': 'AI Phishing & Deepfake Detector',
-                'version': '1.0-prototype'
+                'version': '1.0-prototype',
+                'analysis_options': {
+                    'ocr_enabled': run_ocr,
+                    'experimental_models_enabled': run_models,
+                    'warm_analysis_target_seconds': analysis_target_seconds,
+                    'first_run_includes_model_or_ocr_initialization': True,
+                },
             },
             'email_tests': [],
             'media_tests': [],
@@ -36,10 +89,16 @@ class Benchmark:
         total_times = []
         analysis_times = []
         report_times = []
-        for i in range(iterations):
+        for _ in range(iterations):
             total_start = time.perf_counter()
             analysis_start = time.perf_counter()
-            result = scan_email(text)
+            ml_result = None
+            if self.run_models:
+                from utils.experimental_models import classify_email
+
+                tokenizer, model, torch = get_email_classifier()
+                ml_result = classify_email(text, tokenizer, model, torch)
+            result = scan_email(text, ml_result=ml_result)
             analysis_times.append(time.perf_counter() - analysis_start)
             report_start = time.perf_counter()
             render_report({'analysis': result})
@@ -53,7 +112,8 @@ class Benchmark:
             'avg_total_processing_time_s': round(sum(total_times)/len(total_times), 6),
             'min_time_s': round(min(total_times), 6),
             'max_time_s': round(max(total_times), 6),
-            'risk_score': result['risk_score']
+            'risk_score': result['risk_score'],
+            **analysis_timing_summary(analysis_times, self.analysis_target_seconds),
         }
     
     def test_media(self, data, filename, mime=''):
@@ -61,9 +121,15 @@ class Benchmark:
         analysis_times = []
         report_times = []
         iterations = 3
-        for i in range(iterations):
+        for _ in range(iterations):
             total_start = time.perf_counter()
-            result = media_metadata(data, filename, mime)
+            result = media_metadata(
+                data,
+                filename,
+                mime,
+                run_ocr=self.run_ocr,
+                run_models=self.run_models,
+            )
             analysis_times.append(result['analysis_time_seconds'])
             report_start = time.perf_counter()
             render_report(result)
@@ -81,9 +147,11 @@ class Benchmark:
             'min_time_s': round(min(total_times), 6),
             'max_time_s': round(max(total_times), 6),
             'media_type': result.get('media_type'),
+            'model_execution_status': model_execution_status(result, self.run_models),
             'sha256': result.get('sha256_before'),
             'integrity_verified': result.get('integrity_verified'),
-            'inspection_error': result.get('inspection_error')
+            'inspection_error': result.get('inspection_error'),
+            **analysis_timing_summary(analysis_times, self.analysis_target_seconds),
         }
 
     def test_capacity(self, data, filename, mime=''):
@@ -94,7 +162,13 @@ class Benchmark:
         result = None
         for _ in range(iterations):
             total_start = time.perf_counter()
-            result = media_metadata(data, filename, mime)
+            result = media_metadata(
+                data,
+                filename,
+                mime,
+                run_ocr=self.run_ocr,
+                run_models=self.run_models,
+            )
             analysis_times.append(result['analysis_time_seconds'])
             report_start = time.perf_counter()
             render_report(result)
@@ -106,11 +180,13 @@ class Benchmark:
             'size_mib': round(len(data) / (1024 * 1024), 4),
             'iterations': iterations,
             'media_type': result.get('media_type'),
+            'model_execution_status': model_execution_status(result, self.run_models),
             'avg_analysis_time_s': round(sum(analysis_times) / iterations, 6),
             'avg_report_generation_time_s': round(sum(report_times) / iterations, 6),
             'avg_total_processing_time_s': round(sum(total_times) / iterations, 6),
             'processed_without_error': not result.get('inspection_error'),
-            'integrity_verified': result.get('integrity_verified')
+            'integrity_verified': result.get('integrity_verified'),
+            **analysis_timing_summary(analysis_times, self.analysis_target_seconds),
         })
 
     @staticmethod
@@ -259,5 +335,27 @@ Your account will be suspended. Click here to verify your password immediately.
         print(json.dumps(self.results, indent=2))
 
 if __name__ == '__main__':
-    b = Benchmark()
+    parser = argparse.ArgumentParser(description='Measure detector analysis and report timings.')
+    parser.add_argument(
+        '--include-ocr',
+        action='store_true',
+        help='Enable OCR (including its initial engine load) during media analysis.',
+    )
+    parser.add_argument(
+        '--include-models',
+        action='store_true',
+        help='Enable experimental classifiers; missing model weights may be downloaded.',
+    )
+    parser.add_argument(
+        '--analysis-target-seconds',
+        type=float,
+        default=15,
+        help='Warm per-input analysis ceiling recorded in benchmark results (default: 15).',
+    )
+    args = parser.parse_args()
+    b = Benchmark(
+        run_ocr=args.include_ocr,
+        run_models=args.include_models,
+        analysis_target_seconds=args.analysis_target_seconds,
+    )
     b.run()

@@ -53,5 +53,7 @@ if defined DETECTOR_FFMPEG_RUNTIME if exist "%DETECTOR_FFMPEG_RUNTIME%\imageio_f
     )
 )
 
-"%PYTHON%" -m streamlit run app.py
+if not defined DETECTOR_PORT set "DETECTOR_PORT=8502"
+set "PORT_ARGS=--server.port %DETECTOR_PORT%"
+"%PYTHON%" -m streamlit run app.py --server.address 127.0.0.1 --server.maxUploadSize 50 --server.headless true %PORT_ARGS%
 if errorlevel 1 pause

@@ -1,32 +1,33 @@
-END-TO-END ENCRYPTED CHAT APPLICATION
-=====================================
+LOCAL END-TO-END ENCRYPTED CHAT
+===============================
 
-SETUP:
-1. Install dependencies for server:
-   cd server
-   pip install -r ../requirements.txt
+1. In PowerShell, run:
+   .\start_server.bat
+2. Open http://127.0.0.1:5000/ in two browser profiles or windows.
+3. Create a different local account in each profile. Use a password with at
+   least 12 characters and click "Load or Generate Local Keys".
+4. Select the other account. Compare the complete fingerprint in person or by
+   phone against that person's "Your public-key fingerprint", then confirm it
+   in the UI. Both participants should verify the other's fingerprint.
+5. Send a message. Expand "Encrypted payload sent through the relay" in the
+   sender's message bubble to show the ciphertext envelope; the recipient sees
+   the decrypted text.
+6. Send files up to 10 MiB. The sender and recipient must each verify the
+   other's fingerprint before sending.
 
-2. Start the server:
-   python app.py
-   (Server runs on http://localhost:5000)
+The local server stores scrypt password hashes and public keys in SQLite. Private
+encryption and signing keys stay in IndexedDB in the browser profile. Clearing
+browser data loses account access; there is no password reset or key recovery.
 
-3. Open clients:
-   Open e2ee_chat/client/index.html in TWO different browser windows/tabs
-   Or serve the files via a web server
+Run server tests with:
+   python -m unittest discover -s e2ee_chat\tests -p test_server.py
 
-HOW TO TEST:
-1. In Window 1: Enter username, click "Generate Encryption Keys", click "Connect to Chat"
-2. In Window 2: Do the same with different username
-3. Select the other user from the online users list
-4. Send messages - they are end-to-end encrypted
-5. Try sending files/images - also encrypted
+Run browser crypto tests with:
+   node tests\test_chat_crypto.js
 
-SECURITY NOTES:
-- Server logs show "Relaying encrypted message" but cannot decrypt
-- Private keys never leave the browser
-- Each message uses a unique AES-256 key
-- AES-GCM provides authentication
-- Files are encrypted before transmission
+The tests demonstrate that only the intended recipient can decrypt a message,
+the sender signature verifies, changed/unverified peer keys block sending,
+and unauthenticated clients cannot enumerate users or send messages.
 
-FOR SUBMISSION:
-Include this entire e2ee_chat folder with source code.
+The service binds to loopback and uses local HTTP. Do not expose it to a network
+or use it for sensitive real-world communication.

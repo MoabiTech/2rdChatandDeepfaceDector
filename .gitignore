@@ -4,3 +4,4 @@ __pycache__/
 .env
 .streamlit/secrets.toml
 .DS_Store
+e2ee_chat/server/chat_users.sqlite3*

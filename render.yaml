@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: ai-chat-detector-chat
+    runtime: python
+    plan: free
+    rootDir: e2ee_chat
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server/app.py
+    healthCheckPath: /api/health
+    envVars:
+      - key: CHAT_HOST
+        value: 0.0.0.0
+      - key: E2EE_CHAT_DATABASE
+        value: /tmp/chat_users.sqlite3
+      - key: E2EE_CHAT_SECRET_KEY
+        generateValue: true
+      - key: DETECTOR_URL
+        sync: false
+  - type: web
+    name: ai-chat-detector
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true --server.maxUploadSize 50
+    healthCheckPath: /
+    envVars:
+      - key: PORTAL_CHAT_URL
+        sync: false
+      - key: PUBLIC_DEPLOYMENT
+        value: "true"

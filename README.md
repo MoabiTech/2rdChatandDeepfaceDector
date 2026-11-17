@@ -26,40 +26,31 @@ requirements automatically when needed. If `py` is not recognized, use
 Use `start_detector.bat` or `e2ee_chat\start_server.bat` only to start one
 service for development; the combined sign-in flow requires both services.
 
-## Optional cloud deployment
+## Optional Render deployment
 
-The detector and chat are separate services in the cloud. The detector can run
-on Streamlit Community Cloud; the chat relay can run as a Render web service.
-The deployment uses HTTPS between the detector and chat for session validation.
+The `render.yaml` Blueprint defines two public Render web services: the
+Streamlit detector and the E2EE chat relay. Deploy the Blueprint from this
+repository in Render, then set the cross-service URLs:
 
-1. Deploy the detector on Streamlit Community Cloud from this repository and
-   select `app.py` as the app file. The repository-root `requirements.txt` is
-   used.
-2. Deploy `render.yaml` as a Render Blueprint. Set its `DETECTOR_URL`
-   environment variable to the public
-   Streamlit app URL, including `https://` and a trailing slash.
-3. Add these secrets in the Streamlit app settings, replacing the example URL
-   with the public Render URL:
+1. In the **ai-chat-detector** service, set `PORTAL_CHAT_URL` to the HTTPS URL
+   of **ai-chat-detector-chat**.
+2. In **ai-chat-detector-chat**, set `DETECTOR_URL` to the HTTPS URL of
+   **ai-chat-detector**, including the trailing slash.
+3. Redeploy both services, then open the chat service, create an account, and
+   launch **Detector** from the signed-in app choices. Both URLs must use HTTPS.
 
-   ```toml
-   PORTAL_CHAT_URL = "https://your-chat-service.onrender.com"
-   PUBLIC_DEPLOYMENT = "true"
-   ```
-
-4. Open the Render chat URL, create an account, and test **Detector** from the
-   signed-in app choices. Keep the two URLs on HTTPS.
-
-The Render Blueprint uses a free service and `/tmp/chat_users.sqlite3`.
-Free-service storage is ephemeral: accounts, public keys, and sign-in sessions
-may be lost when Render restarts or redeploys the service. This does not meet a
-durable-storage requirement. A paid persistent disk or managed database is
-needed before relying on account retention. The free instance may also sleep,
-so first connection can be delayed.
+Both services use Render's free plan. SQLite is stored at
+`/tmp/chat_users.sqlite3`, which is ephemeral: accounts, public keys, and
+sessions may be lost when Render restarts or redeploys the chat service. This
+does not meet a durable-storage requirement. A paid persistent disk or managed
+database is needed before relying on account retention. Free services may also
+sleep, so first connection can be delayed.
 
 Public deployment changes the privacy boundary: uploaded email and media are
 sent to and processed by the hosted detector. The detector's optional model
-weights are downloaded at runtime and may exceed free-tier memory, disk, or
-startup limits. The AI models remain experimental; do not upload sensitive or
+weights are downloaded at runtime and may exceed the free plan's 512 MiB memory
+or startup limits. The free plan may not be sufficient for OCR or transformer
+model inference. The AI models remain experimental; do not upload sensitive or
 regulated data or treat results as proof of authenticity.
 
 The chat issues a 12-hour bearer session token to open the detector; it is
@@ -70,12 +61,12 @@ The app should open in your browser. If it does not, visit the local URL printed
 
 ## Local-only input safeguards
 
-The supplied launcher and `.streamlit/config.toml` bind Streamlit to `127.0.0.1`,
-limit the upload endpoint to 50 MiB, keep Streamlit's CORS and XSRF protections
-enabled, and disable usage-stat collection. The app refuses to start if its
-effective Streamlit bind address is not `127.0.0.1`, `localhost`, or `::1`.
-Use `start_detector.bat`; do not override the local-only bind setting or expose
-the app through a tunnel, reverse proxy, firewall rule, or public listener.
+For local development, the supplied launcher and `.streamlit/config.toml` bind
+Streamlit to `127.0.0.1`, limit the upload endpoint to 50 MiB, keep CORS and
+XSRF protections enabled, and disable usage-stat collection. The app refuses a
+non-loopback listener unless `PUBLIC_DEPLOYMENT=true` and the chat URL uses
+HTTPS. Use `start_detector.bat` locally; do not expose its local configuration
+through a tunnel, reverse proxy, firewall rule, or public listener.
 
 Before analysis, the detector enforces per-category limits of 1 MiB for TXT/EML,
 10 MiB for images, 20 MiB for audio, and 50 MiB for video. It validates file

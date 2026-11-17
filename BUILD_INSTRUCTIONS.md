@@ -23,5 +23,5 @@ application.
 ## Run the chat demo
 
 From the `e2ee_chat` folder, run `start_server.bat`, then open
-http://127.0.0.1:5000/. On its first run the script creates a local virtual
+http://127.0.0.1:5001/. On its first run the script creates a local virtual
 environment and installs the chat dependencies.

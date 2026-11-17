@@ -122,7 +122,7 @@ setx HF_HOME "D:/detector/hf-cache"
 `reports/part-i-risk-management.md` contains a proposed identification, assessment, and control process with a compact risk register, scoring, owners, and SecSDLC checks. It is explicitly a university-context baseline: internal LUCT evidence and staff interviews were unavailable, so it must not be presented as a verified audit or as proof that controls do not exist. Confirm institutional facts, risk ratings, owners, and treatment decisions with authorized staff; format and check the final 21-page limit.
 
 ### 3.2 End-to-end Encrypted Chat Application: implemented classroom demo
-`e2ee_chat/` contains the browser client, relay server, setup instructions, and tests. The browser uses AES-GCM for payloads and RSA-OAEP to wrap each payload key. Relay and browser-crypto tests pass. Public keys are not authenticated, forward secrecy is not provided, and metadata remains visible; the demo is not production-ready.
+`e2ee_chat/` contains the browser client, local SQLite account relay, setup instructions, and tests. Passwords use scrypt hashes; non-exportable browser keys are bound to accounts; peer fingerprints require independent out-of-band confirmation; ECDSA signatures authenticate message and file envelopes. The relay and browser-crypto regression suites cover these behaviors. Forward secrecy, recovery, HTTPS, and metadata protection are not provided; keep the demo on loopback.
 
 The brief's marking table and report headings assign Part II differently. The project includes both the detector and chat demo; confirm with the lecturer which components are assessed under each heading.
 

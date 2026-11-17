@@ -14,11 +14,11 @@ This local prototype screens suspicious email text and inspects text, image, aud
 
 ### System and models
 
-Email rules check urgency, credential and MFA requests, payments, impersonation, secrecy, QR lures, and suspicious URLs. URLs and QR destinations are extracted and screened but never opened. Optional local OCR screens image text and up to eight sampled video frames. The experimental image/video classifier is enabled by default for visual uploads; first use downloads about 355 MiB of model weights. Email classification remains opt-in. Results remain estimates and are not independently validated by this project.
+Email rules check urgency, credential and MFA requests, payments, impersonation, secrecy, QR lures, and suspicious URLs. URLs and QR destinations are extracted and screened but never opened. The local email classifier is enabled by default, and can be unchecked for rules-only analysis. Optional local OCR screens image text and up to eight sampled video frames. The experimental image/video classifier is enabled by default for visual uploads; first use downloads about 355 MiB of model weights. Classifier results remain estimates and are not independently validated by this project.
 
 | Capability | Model / method | Scope and limitation |
 |---|---|---|
-| Email | DistilBERT `cybersectony/phishing-email-detection-distilbert_v2.4.1` | Optional; up to 512 tokens. Model-card metrics are not this project's evaluation. |
+| Email | DistilBERT `cybersectony/phishing-email-detection-distilbert_v2.4.1` | Enabled by default; up to 512 tokens. Model-card metrics are not this project's evaluation. |
 | Image and sampled video frames | SigLIP `prithivMLmods/deepfake-detector-model-v1` | Image-level estimate; video samples at most eight frames and does not analyze temporal consistency. |
 | Audio | Wav2Vec2 `Hemgg/Deepfake-audio-detection` | Enabled by default for WAV/FLAC/OGG/AIFF/M4A; M4A is decoded locally and up to 20 seconds are analyzed after first-use model loading. |
 | Text extraction | RapidOCR / ONNX Runtime | Optional for images/video; OCR may omit or misread text. |
@@ -28,25 +28,25 @@ Email risk scoring, OCR/QR findings, classifier estimates, and logo similarity a
 
 ### Verification results
 
-Validated on Windows 11, Python 3.13.7, Intel Core i5-1135G7 (8 logical processors), 11.8 GiB RAM, CPU inference. Measurements are three media runs and five email runs; optional model inference and OCR are disabled. They are sample averages, not performance guarantees. Report generation is measured separately as JSON serialization and is included in total time.
+Validated on Windows 11, Python 3.13.7, Intel Core i5-1135G7 (8 logical processors), 11.79 GiB RAM, CPU inference. Measurements refreshed on 7 November 2026 are three media runs and five email runs; optional model inference and OCR are disabled. They are sample averages, not performance guarantees and were not measured on the submitted 8 GiB target configuration or in the cloud. Report generation is measured separately as JSON serialization and is included in total time.
 
 | Test input | Average analysis | Average report generation | Average total | Largest successful sample observed |
 |---|---:|---:|---:|---:|
-| Suspicious email text | 0.009992 s | 0.000444 s | 0.010446 s | Not capacity-tested |
-| Benign email text | 0.000497 s | 0.000207 s | 0.000708 s | Not capacity-tested |
-| PNG image, 1.4679 MiB | 0.282738 s | 0.000316 s | 0.284331 s | 5.6269 MiB |
-| WAV audio, 1 MiB | 0.194181 s | 0.000422 s | 0.194687 s | 5 MiB |
-| AVI video, 1.0909 MiB | 3.058705 s | 0.000890 s | 3.064407 s | 5.5161 MiB |
+| Suspicious email text | 0.006127 s | 0.003137 s | 0.009270 s | Not capacity-tested |
+| Benign email text | 0.000471 s | 0.001878 s | 0.002354 s | Not capacity-tested |
+| PNG image, 1.4679 MiB | 0.406071 s | 0.004796 s | 0.428021 s | 5.6269 MiB |
+| WAV audio, 1 MiB | 0.015747 s | 0.004737 s | 0.039353 s | 5 MiB |
+| AVI video, 1.0909 MiB | 1.655972 s | 0.003560 s | 1.663139 s | 5.5161 MiB |
 
-These are largest tested files, not maximum supported sizes. The application does not establish a safe hard maximum for every decoder or browser upload. SHA-256 before/after matched on all measured media samples; inspection reads uploaded bytes without rewriting them. The 34-test detector suite, 3 chat relay tests, and 2 browser crypto tests pass in the project environment.
+These largest successful samples are not the configured category limits. Upload validation enforces 1 MiB for text, 10 MiB for images, 20 MiB for audio, and 50 MiB for video, along with content checks and image dimension limits. Pasted email fields are capped at 1 MiB combined by UTF-8 byte length. SHA-256 before/after matched on the measured media samples; inspection reads uploaded bytes without rewriting them. **Tests:** 52 detector, 9 chat-relay, and 8 browser-crypto tests pass. Chat coverage includes authentication, access restrictions, peer-key pinning, and an Alice-to-Bob encrypt/decrypt flow.
 
-The 5.6269 MiB PNG, 5 MiB WAV, and 5.5161 MiB AVI capacity samples completed without inspection errors (three-run average total times 1.763788 s, 0.136402 s, and 2.705396 s respectively). These larger-file times are not model-enabled or OCR-enabled. Audio classifier tests use mocked model outputs to verify audio resampling, chunking, and report handling; they are not an independent accuracy or latency evaluation.
+The 5.6269 MiB PNG, 5 MiB WAV, and 5.5161 MiB AVI capacity samples completed without inspection errors (three-run average total times 1.012684 s, 0.065648 s, and 2.152559 s respectively). These larger-file times are not model-enabled or OCR-enabled. Audio classifier tests use mocked model outputs to verify audio resampling, chunking, and report handling; they are not an independent accuracy or latency evaluation.
 
 An M4A voice note of 44.16 seconds decoded and completed local model inference. The classifier analyzed the first 20 seconds and reported 24.16 seconds omitted; its estimate was 5.9% synthetic-like. The original file hash was unchanged. Model loading plus report generation took 114.27 seconds in this single run. This result is an experimental estimate, not evidence of model accuracy or proof that the voice is genuine.
 
 ### Encrypted chat and lessons learnt
 
-The browser encrypts each message/file with AES-256-GCM and wraps a fresh AES key to the recipient's RSA-OAEP-2048/SHA-256 public key. The relay forwards ciphertext and does not decrypt it. Browser crypto tests verify round trips and modified-ciphertext rejection; file transfer is capped at 10 MiB. This classroom demo does not authenticate public keys, provide forward secrecy, or protect connection metadata; do not expose it to the public internet.
+The local relay stores scrypt password hashes and account-bound public keys in SQLite. Browser profiles persist non-exportable RSA-OAEP-2048 encryption and ECDSA P-256 signing keys in IndexedDB. Users compare full SHA-256 fingerprints (displayed for their own and peer keys) over an independent trusted channel before sending; changed or unverified keys block text and file sends. Fresh AES-256-GCM keys are wrapped with RSA-OAEP/SHA-256, and ECDSA-SHA-256 signatures bind sender, recipient, ciphertext, wrapped key, IV, and file metadata. Tests demonstrate recipient-only decryption, ciphertext-only relay, authentication rejection, and unauthenticated access controls. The sent-message disclosure shows the encrypted envelope sent to the relay. Traffic metadata remains visible; there is no recovery, forward secrecy, HTTPS, or protection from a compromised server serving modified browser code. Loopback only.
 
 Part I reinforced that risk ownership, evidence, likelihood/impact scoring, and tested controls are needed before residual risk can be accepted. Part II demonstrated the value of independent identity verification, layered detection, safe URL handling, preserving file hashes, measuring performance on real hardware, and documenting limitations. An AI score is not proof: staff must verify high-impact requests through a separately known channel. Future work is to populate the logo reference set with authorized assets, validate models on labelled held-out samples, measure model-enabled latency, and obtain institution-specific risk evidence.
 

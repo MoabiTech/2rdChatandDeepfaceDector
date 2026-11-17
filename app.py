@@ -10,14 +10,61 @@ import json
 import mimetypes
 import os
 import ipaddress
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from email import policy
 from email.parser import BytesParser
 from html.parser import HTMLParser
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from PIL import Image
+from utils.input_safety import (
+    MAX_TEXT_INPUT_BYTES,
+    UploadValidationError,
+    privacy_safe_report,
+    text_input_size_bytes,
+    validate_upload,
+    validate_upload_size,
+)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def app_setting(name: str, default: str) -> str:
+    if name in os.environ:
+        return os.environ[name]
+    try:
+        return str(st.secrets.get(name, default))
+    except st.errors.StreamlitSecretNotFoundError:
+        return default
+
+
+PORTAL_CHAT_URL = app_setting('PORTAL_CHAT_URL', 'http://127.0.0.1:5001').rstrip('/')
+PUBLIC_DEPLOYMENT = app_setting('PUBLIC_DEPLOYMENT', 'false').strip().lower() == 'true'
+PORTAL_SESSION_API = f'{PORTAL_CHAT_URL}/api/session'
+
+
+def portal_session_request(action: str, token: str):
+    request = Request(
+        f'{PORTAL_SESSION_API}/{action}',
+        data=json.dumps({'token': token}).encode('utf-8'),
+        headers={'Content-Type': 'application/json'},
+        method='POST',
+    )
+    try:
+        with urlopen(request, timeout=3) as response:
+            result = json.loads(response.read().decode('utf-8'))
+    except HTTPError as error:
+        if error.code == 401:
+            return None
+        raise RuntimeError(f'The sign-in service returned HTTP {error.code}.') from error
+    except (URLError, TimeoutError) as error:
+        raise RuntimeError('The sign-in service is unavailable.') from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError('The sign-in service returned an invalid response.') from error
+    if not isinstance(result, dict):
+        raise RuntimeError('The sign-in service returned an invalid response.')
+    return result
 
 
 @st.cache_resource
@@ -57,6 +104,16 @@ def get_logo_detector():
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def sha256_email_input(sender: str, subject: str, body: str) -> str:
+    email_input = json.dumps(
+        {'sender': sender, 'subject': subject, 'body': body},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    return sha256_bytes(email_input)
 
 
 class _HtmlTextExtractor(HTMLParser):
@@ -261,6 +318,15 @@ def scan_email(
         'module': 'Rule-based email screening with optional experimental ML',
         'risk_score': score,
         'risk_level': level,
+        'assessment_status': (
+            'Suspicious indicators present; not independently confirmed.'
+            if score
+            else 'Inconclusive: no configured rule matched.'
+        ),
+        'uncertainty': (
+            'Rule-based scores are triage signals, not calibrated probabilities. '
+            'A low score does not prove that a message is safe.'
+        ),
         'findings': findings,
         'urls_found': urls,
         'model_status': (
@@ -290,10 +356,11 @@ def media_metadata(
     run_ocr: bool = False,
     run_models: bool = False,
 ):
+    validate_upload(data, filename)
     start_time = time.perf_counter()
     info = {
         'filename': filename,
-        'mime_type': mime or mimetypes.guess_type(filename)[0] or 'unknown',
+        'mime_type': mimetypes.guess_type(filename)[0] or 'application/octet-stream',
         'size_bytes': len(data),
         'size_mib': round(len(data) / (1024 * 1024), 4),
         'sha256_before': sha256_bytes(data),
@@ -323,8 +390,8 @@ def media_metadata(
                     tokenizer, model, torch = get_email_classifier()
                     ml_result = classify_email(text, tokenizer, model, torch)
                     info['experimental_phishing_classification'] = ml_result
-                except Exception as model_error:
-                    info['phishing_model_error'] = str(model_error)
+                except Exception:
+                    info['phishing_model_error'] = 'Optional local email model could not run; details omitted.'
             info['email_analysis'] = scan_email(text, sender, subject, ml_result)
             info['metadata_note'] = 'Text is analyzed using transparent rules and optional experimental local classification. No links are opened.'
         elif ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff']:
@@ -347,18 +414,18 @@ def media_metadata(
                     'similarity checked'
                 )
                 if logo_errors:
-                    info['logo_detection_error'] = '; '.join(item['error'] for item in logo_errors)
-            except Exception as logo_error:
+                    info['logo_detection_error'] = 'One or more configured logo references could not be inspected.'
+            except Exception:
                 info['logo_detection_status'] = 'error'
-                info['logo_detection_error'] = str(logo_error)
+                info['logo_detection_error'] = 'Local logo comparison could not run; details omitted.'
 
             try:
                 from utils.experimental_models import decode_qr_codes
 
                 qr_payloads = decode_qr_codes(image)
                 info['qr_payloads'] = qr_payloads
-            except Exception as qr_error:
-                info['qr_detection_error'] = str(qr_error)
+            except Exception:
+                info['qr_detection_error'] = 'Local QR inspection could not run; details omitted.'
 
             if run_ocr:
                 try:
@@ -368,8 +435,8 @@ def media_metadata(
                     info['ocr'] = ocr_result
                     info['ocr']['engine'] = 'RapidOCR using ONNX Runtime'
                     extracted_text = ocr_result['text']
-                except Exception as ocr_error:
-                    info['ocr_error'] = str(ocr_error)
+                except Exception:
+                    info['ocr_error'] = 'Local OCR could not run; details omitted.'
 
             if run_models:
                 try:
@@ -380,8 +447,8 @@ def media_metadata(
                         [image], processor, model, torch
                     )[0]
                     info['deepfake_classifier_status'] = 'completed'
-                except Exception as model_error:
-                    info['deepfake_model_error'] = str(model_error)
+                except Exception:
+                    info['deepfake_model_error'] = 'Optional local image model could not run; details omitted.'
                     info['deepfake_classifier_status'] = 'error'
                 
         elif ext in ['.wav', '.flac', '.ogg', '.aif', '.aiff', '.m4a']:
@@ -396,11 +463,10 @@ def media_metadata(
                     from utils.experimental_models import decode_m4a_audio
 
                     audio_data, source_duration = decode_m4a_audio(data)
-                except Exception as decode_error:
-                    info['deepfake_classifier_status'] = 'error'
-                    info['deepfake_model_error'] = f'M4A decoding failed: {decode_error}'
-                    info['metadata_note'] = 'M4A audio could not be decoded for inspection.'
-                    audio_data = None
+                except Exception:
+                    raise UploadValidationError(
+                        'M4A audio could not be decoded by the available local decoder.'
+                    ) from None
 
             if audio_data is not None:
                 audio_info = sf.info(io.BytesIO(audio_data))
@@ -435,8 +501,8 @@ def media_metadata(
                         )
                     info['experimental_ai_classification'] = classification
                     info['deepfake_classifier_status'] = 'completed'
-                except Exception as model_error:
-                    info['deepfake_model_error'] = str(model_error)
+                except Exception:
+                    info['deepfake_model_error'] = 'Optional local audio model could not run; details omitted.'
                     info['deepfake_classifier_status'] = 'error'
         elif ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
             info['deepfake_classifier_status'] = 'not run'
@@ -448,9 +514,10 @@ def media_metadata(
                 frames, video_metadata = extract_video_frames(data, ext)
                 info.update(video_metadata)
                 info['sampled_frame_count'] = len(frames)
-            except Exception as video_error:
-                info['video_inspection_error'] = str(video_error)
-                frames = []
+            except Exception:
+                raise UploadValidationError(
+                    "The video is invalid or cannot be decoded by the available local tools."
+                ) from None
             if frames and run_ocr:
                 try:
                     from utils.experimental_models import extract_text_from_image
@@ -468,8 +535,8 @@ def media_metadata(
                         'engine': 'RapidOCR using ONNX Runtime',
                         'sampled_frame_detections': ocr_results,
                     }
-                except Exception as ocr_error:
-                    info['ocr_error'] = str(ocr_error)
+                except Exception:
+                    info['ocr_error'] = 'Local OCR could not run; details omitted.'
             if frames:
                 try:
                     from utils.experimental_models import decode_qr_codes
@@ -478,8 +545,8 @@ def media_metadata(
                         qr_payloads.extend(decode_qr_codes(frame))
                     qr_payloads = list(dict.fromkeys(qr_payloads))
                     info['qr_payloads'] = qr_payloads
-                except Exception as qr_error:
-                    info['qr_detection_error'] = str(qr_error)
+                except Exception:
+                    info['qr_detection_error'] = 'Local QR inspection could not run; details omitted.'
             if frames and run_models:
                 try:
                     from utils.experimental_models import classify_images
@@ -502,14 +569,16 @@ def media_metadata(
                             ),
                         }
                         info['deepfake_classifier_status'] = 'completed'
-                except Exception as model_error:
-                    info['deepfake_model_error'] = str(model_error)
+                except Exception:
+                    info['deepfake_model_error'] = 'Optional local video model could not run; details omitted.'
                     info['deepfake_classifier_status'] = 'error'
         else:
             info['media_type'] = 'other'
             info['metadata_note'] = f'File type {ext} not in supported categories for detailed inspection.'
-    except Exception as exc:
-        info['inspection_error'] = str(exc)
+    except UploadValidationError:
+        raise
+    except Exception:
+        info['inspection_error'] = 'The file could not be parsed by the available local inspectors.'
         info['metadata_note'] = 'File could not be parsed by available inspectors.'
     
     if extracted_text:
@@ -536,6 +605,21 @@ def media_metadata(
         'Model scores are estimates, not proof. A low score does not prove the media is authentic, '
         'and a high score does not prove it is manipulated.'
     )
+    suspicious_text_signal = any(
+        info.get(key, {}).get('risk_score', 0) > 0
+        for key in ('email_analysis', 'ocr_email_analysis', 'qr_email_analysis')
+    )
+    info['assessment_status'] = (
+        'Suspicious indicators present; not independently confirmed.'
+        if suspicious_text_signal else
+        'Experimental model estimate only; outcome is unconfirmed.'
+        if info.get('experimental_ai_classification') or info.get('experimental_frame_classification') else
+        'Inconclusive: no validated media classification was produced.'
+    )
+    info['uncertainty'] = (
+        'Model outputs are experimental and uncalibrated for this application. '
+        'Metadata, OCR, logo similarity, and heuristic indicators do not establish authenticity or manipulation.'
+    )
     info['sha256_after'] = sha256_bytes(data)
     info['integrity_verified'] = info['sha256_before'] == info['sha256_after']
     info['recommendations'] = [
@@ -558,7 +642,26 @@ def media_metadata(
     return info
 
 def render_report(report):
-    return json.dumps(report, indent=2, ensure_ascii=False)
+    return json.dumps(privacy_safe_report(report), indent=2, ensure_ascii=False)
+
+
+def is_loopback_bind_address(address: str | None) -> bool:
+    """Only allow addresses that resolve to the local machine."""
+    return str(address or '').strip().lower() in {'127.0.0.1', 'localhost', '::1'}
+
+
+def is_https_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        return (
+            parsed.scheme == 'https'
+            and bool(parsed.hostname)
+            and parsed.username is None
+            and parsed.password is None
+        )
+    except ValueError:
+        return False
+
 
 def clear_media_report():
     st.session_state.pop('media_report', None)
@@ -584,311 +687,587 @@ def render_integrity_status(integrity_verified: bool) -> None:
         st.error('Integrity verification failed: before/after SHA-256 values differ.')
 
 
-def run_app():
-    st.set_page_config(page_title='AI Phishing & Deepfake Detector', page_icon='🔍', layout='wide')
-    st.title('AI Phishing & Deepfake Detector')
-    st.caption('Email screening, media inspection, integrity checks, and downloadable reports')
-    st.warning(
-        'Local OCR and experimental classifiers are available. Image, video, and audio classifiers run by default '
-        'for matching uploads; model weights download on first use. '
-        'Their reported scores have not been independently validated for this application and cannot establish '
-        'authenticity. Rule-based findings and model estimates are reported separately.'
+def render_project_evidence() -> None:
+    st.subheader('Part II | Evidence and presentation')
+    st.caption(
+        'Use this panel to explain what the local system does and what has actually been measured. '
+        'Classifier outputs are experimental estimates, not verified verdicts.'
     )
 
-    email_tab, media_tab = st.tabs(['Email analysis', 'Media inspection'])
-
-    with email_tab:
-        st.subheader('Screen email text')
-        sender = st.text_input('Sender address (optional)', key='email_sender')
-        subject = st.text_input('Subject (optional)', key='email_subject')
-        email_text = st.text_area('Paste email text', height=220, key='email_body')
-        run_email_model = st.checkbox(
-            'Run experimental local email classifier (downloads about 270 MB on first use)',
-            key='run_email_model',
+    st.markdown('#### Performance acceptance targets')
+    performance_columns = st.columns(5)
+    performance_columns[0].metric('Email/text', '≤ 15 s', 'warm-analysis target')
+    performance_columns[1].metric('Image', '≤ 15 s', 'warm-analysis target')
+    performance_columns[2].metric('Audio', '≤ 15 s', 'warm-analysis target')
+    performance_columns[3].metric('Video', '≤ 15 s', 'warm-analysis target')
+    performance_columns[4].metric('Report generation', '≤ 5 s', 'after analysis')
+    st.info(
+        'The 15-second target applies to analysis after selected models have loaded. First-time model '
+        'downloads and initialization are measured separately and may take longer. These are requested '
+        'targets, not verified results; target-device measurements remain outstanding.'
+    )
+    st.caption(
+        'Upload limits: text 1 MiB, image 10 MiB, audio 20 MiB, video 50 MiB. '
+        'The application rejects unsupported or oversized uploads with a user-facing explanation.'
+    )
+    with st.expander('Previously measured local baseline (not the target device)'):
+        st.markdown(
+            '- Suspicious email: 0.0093 s average across 5 runs.\n'
+            '- Image: 0.428 s average for a 1.47 MiB PNG.\n'
+            '- Audio: 0.0394 s average for a 1 MiB WAV.\n'
+            '- Video: 1.663 s average for a 1.09 MiB AVI.\n'
+            '- Largest successful samples: 5.63 MiB image, 5 MiB audio, and 5.52 MiB video.'
         )
-        if st.button('Analyze email', type='primary'):
-            if not email_text.strip() and not subject.strip():
-                st.error('Enter an email subject or message before analysis.')
-            else:
-                processing_start = time.perf_counter()
-                ml_result = None
-                ml_error = None
-                if run_email_model:
-                    try:
-                        with st.spinner('Loading local email classifier and analyzing message...'):
-                            from utils.experimental_models import classify_email
+    st.caption(
+        'Baseline measurements were made on Windows 11 with an Intel Core i5-1135G7, 8 logical processors, '
+        'and 11.79 GiB RAM on 2026-11-07, with optional OCR and model inference disabled (3 media runs, '
+        '5 email runs). They do not establish warm-model or target-device performance. The encrypted chat '
+        'file-transfer limit is 10 MiB.'
+    )
 
-                            tokenizer, model, torch = get_email_classifier()
-                            ml_result = classify_email(
-                                f'{subject}\n{sender}\n{email_text}', tokenizer, model, torch
-                            )
-                    except Exception as model_error:
-                        ml_error = str(model_error)
-                analysis = scan_email(email_text, sender, subject, ml_result)
-                email_report = {
-                    'generated_at': datetime.now(timezone.utc).isoformat(),
-                    'sender': sender,
-                    'subject': subject,
-                    'analysis': analysis,
-                    'ml_model_error': ml_error,
-                }
-                report_start = time.perf_counter()
-                render_report(email_report)
-                report_generation_time = time.perf_counter() - report_start
-                email_report['analysis_wall_time_seconds'] = round(
-                    time.perf_counter() - processing_start, 6
-                )
-                email_report['report_generation_time_seconds'] = round(
-                    report_generation_time, 6
-                )
-                email_report['total_processing_time_seconds'] = round(
-                    email_report['analysis_wall_time_seconds'] + report_generation_time, 6
-                )
-                st.session_state.email_report = email_report
+    with st.expander('AI models, file formats, and extra detection steps', expanded=True):
+        st.markdown(
+            '- **Email:** explainable rules plus an optional local DistilBERT phishing classifier.\n'
+            '- **Image/video:** optional experimental SigLIP classification; video uses up to eight sampled frames.\n'
+            '- **Audio:** optional experimental Wav2Vec2 classification; up to 20 seconds are analyzed.\n'
+            '- **Text extraction:** RapidOCR screens image/video text; QR payloads are extracted and screened.\n'
+            '- **Formats:** TXT/EML; JPG/JPEG, PNG, WEBP, BMP, TIF/TIFF; WAV, FLAC, OGG, AIF/AIFF, M4A; '
+            'MP4, MOV, AVI, MKV, WEBM.\n'
+            '- **Safe handling:** suspicious URLs and QR destinations are listed but never opened. '
+            'Original media bytes are not rewritten; SHA-256 hashes are compared before and after inspection.\n'
+            '- **Limitations:** model accuracy has not been independently validated here. OCR can miss text, '
+            'and frame-based video analysis does not measure temporal consistency.'
+        )
 
-        email_report = st.session_state.get('email_report')
-        if email_report:
-            analysis = email_report['analysis']
-            st.metric('Risk score', f"{analysis['risk_score']} / 100", analysis['risk_level'])
-            if email_report.get('ml_model_error'):
-                st.error(f"Optional classifier could not run: {email_report['ml_model_error']}")
-            elif analysis.get('ml_classification'):
-                ml = analysis['ml_classification']
-                st.metric(
-                    'Experimental model estimate',
-                    ml['model_estimate'],
-                    f"{ml['phishing_probability']:.1%} phishing-like probability",
-                )
-                st.caption(ml['limitations'])
-            st.subheader('Findings')
-            for finding in analysis['findings']:
-                st.text(f"{finding['indicator']} (+{finding['points']})")
-            st.caption('Extracted URLs are listed only; the detector never opens them.')
-            if analysis['urls_found']:
-                for url in analysis['urls_found']:
-                    st.code(url, language=None)
-            st.caption(analysis['limitations'])
-            st.subheader('Recommendations')
-            for recommendation in analysis.get('recommendations', []):
-                st.markdown(f'- {recommendation}')
-            st.download_button(
-                'Download email report (JSON)',
-                data=render_report(email_report),
-                file_name='email_analysis_report.json',
-                mime='application/json'
+    st.markdown('#### End-to-end encrypted chat')
+    st.markdown(
+        'The chat uses SQLite-backed password accounts, browser-persisted non-exportable RSA-OAEP and '
+        'ECDSA keys, out-of-band fingerprint pinning, and signed AES-256-GCM message/file envelopes. '
+        'Tests cover account authentication, account-key binding, signatures, and tamper rejection.'
+    )
+    if PUBLIC_DEPLOYMENT:
+        st.warning(
+            'Hosted classroom prototype: compare each peer fingerprint over an independent trusted channel. '
+            'Account records on the free host are ephemeral. There is no recovery, forward secrecy, or metadata '
+            'protection, and a compromised server could change the served client code.'
+        )
+    else:
+        st.warning(
+            'Local-only prototype: compare each peer fingerprint over an independent trusted channel. There is '
+            'no recovery, forward secrecy, HTTPS, metadata protection, or safety if a compromised server changes '
+            'client code. Start `e2ee_chat/start_server.bat` before opening the local chat.'
+        )
+    st.link_button('Return to app choices and chat', PORTAL_CHAT_URL)
+
+    st.markdown('#### Lessons learnt | Part I and Part II')
+    st.markdown(
+        '- **Part I:** identify assets and threats systematically; assess likelihood and impact; select and '
+        'test controls before accepting residual risk.\n'
+        '- **Part II:** combine explainable checks with cautious AI estimates, verify high-impact requests '
+        'through a separate trusted channel, preserve file integrity, and report real performance and limitations.'
+    )
+
+    st.markdown('#### Live presentation checklist')
+    st.markdown(
+        '- **Audibility:** speak clearly, face the audience, and avoid reading every slide verbatim.\n'
+        '- **Confidence:** explain both the evidence and the detector’s limitations honestly.\n'
+        '- **Dress code:** agree on neat, appropriate attire as a team before presentation day.\n'
+        '- **Teamwork:** assign the demo, technical explanation, results, and Q&A roles; support hand-offs.\n'
+        '- **Questions and answers:** prepare to explain model choices, measured runtimes, file-size limits, '
+        'false positives, hash checks, and why the chat is a classroom demo.'
+    )
+    st.caption('Presentation items are reminders for the team to demonstrate; they are not app-generated scores.')
+
+
+def render_email_workspace() -> None:
+    st.subheader('Email threat analysis')
+    st.caption('Screen a suspicious message with explainable rules and an optional local model.')
+    sender = st.text_input('Sender address (optional)', key='email_sender')
+    subject = st.text_input('Subject (optional)', key='email_subject')
+    email_text = st.text_area(
+        'Paste email text (maximum 1 MiB)',
+        height=220,
+        max_chars=MAX_TEXT_INPUT_BYTES,
+        key='email_body',
+    )
+    run_email_model = st.checkbox(
+        'Run experimental local email classifier (downloads about 270 MB on first use)',
+        value=True,
+        key='run_email_model',
+    )
+    if st.button('Analyze email', type='primary', key='analyze_email'):
+        if not email_text.strip() and not subject.strip():
+            st.error('Enter an email subject or message before analysis.')
+        elif text_input_size_bytes(sender, subject, email_text) > MAX_TEXT_INPUT_BYTES:
+            st.error('Email text, subject, and sender must not exceed 1 MiB combined (UTF-8).')
+        else:
+            processing_start = time.perf_counter()
+            email_hash_before = sha256_email_input(sender, subject, email_text)
+            ml_result = None
+            ml_error = None
+            if run_email_model:
+                try:
+                    with st.spinner('Loading local email classifier and analyzing message...'):
+                        from utils.experimental_models import classify_email
+
+                        tokenizer, model, torch = get_email_classifier()
+                        ml_result = classify_email(
+                            f'{subject}\n{sender}\n{email_text}', tokenizer, model, torch
+                        )
+                except Exception:
+                    ml_error = 'Optional local classifier could not run; details omitted.'
+            analysis = scan_email(email_text, sender, subject, ml_result)
+            email_hash_after = sha256_email_input(sender, subject, email_text)
+            email_report = {
+                'generated_at': datetime.now(timezone.utc).isoformat(),
+                'sender': sender,
+                'subject': subject,
+                'analysis': analysis,
+                'ml_model_error': ml_error,
+                'sha256_before': email_hash_before,
+                'sha256_after': email_hash_after,
+                'integrity_verified': email_hash_before == email_hash_after,
+                'integrity_check': (
+                    'SHA-256 covers the submitted sender, subject, and body; '
+                    'the original text is not included in the downloadable report.'
+                ),
+            }
+            email_report['analysis_wall_time_seconds'] = round(
+                time.perf_counter() - processing_start, 6
             )
+            report_start = time.perf_counter()
+            render_report(email_report)
+            email_report['report_generation_time_seconds'] = round(
+                time.perf_counter() - report_start, 6
+            )
+            email_report['total_processing_time_seconds'] = round(
+                email_report['analysis_wall_time_seconds']
+                + email_report['report_generation_time_seconds'],
+                6,
+            )
+            st.session_state.email_report = email_report
 
-    with media_tab:
-        st.subheader('Inspect a media or email file')
-        uploaded_file = st.file_uploader(
-            'Supported: TXT/EML, common images, WAV/FLAC/OGG/AIFF/M4A audio, and common video formats',
-            type=['txt', 'eml', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tif', 'tiff',
-                  'wav', 'flac', 'ogg', 'aif', 'aiff', 'm4a', 'mp4', 'mov', 'avi', 'mkv', 'webm'],
-            key='media_file',
-            on_change=clear_media_report
+    email_report = st.session_state.get('email_report')
+    if not email_report:
+        return
+    analysis = email_report['analysis']
+    st.metric('Risk score', f"{analysis['risk_score']} / 100", analysis['risk_level'])
+    render_integrity_status(email_report['integrity_verified'])
+    if email_report.get('ml_model_error'):
+        st.error(f"Optional classifier could not run: {email_report['ml_model_error']}")
+    elif analysis.get('ml_classification'):
+        ml = analysis['ml_classification']
+        st.metric(
+            'Experimental model estimate',
+            ml['model_estimate'],
+            f"{ml['phishing_probability']:.1%} phishing-like probability",
         )
+        st.caption(ml['limitations'])
+    st.subheader('Findings')
+    for finding in analysis['findings']:
+        st.text(f"{finding['indicator']} (+{finding['points']})")
+    st.caption('Extracted URLs are listed only; the detector never opens them.')
+    for url in analysis['urls_found']:
+        st.code(url, language=None)
+    st.caption(analysis['limitations'])
+    st.subheader('Recommendations')
+    for recommendation in analysis.get('recommendations', []):
+        st.markdown(f'- {recommendation}')
+    st.download_button(
+        'Download email report (JSON)',
+        data=render_report(email_report),
+        file_name='email_analysis_report.json',
+        mime='application/json',
+    )
+
+
+def render_file_workspace(
+    title: str,
+    uploader_key: str,
+    file_types: list[str],
+) -> None:
+    st.subheader(title)
+    uploaded_file = st.file_uploader(
+        'Select a file for inspection',
+        type=file_types,
+        key=uploader_key,
+        on_change=clear_media_report,
+    )
+    st.caption(
+        'Upload limits: text 1 MiB, images 10 MiB, audio 20 MiB, and supported video 50 MiB. '
+        'Unsupported, oversized, or invalid content is rejected before analysis.'
+    )
+    extension = (
+        os.path.splitext(uploaded_file.name)[1].lower()
+        if uploaded_file is not None else ''
+    )
+    is_image = extension in {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff'}
+    is_video = extension in {'.mp4', '.mov', '.avi', '.mkv', '.webm'}
+    is_audio = extension in {'.wav', '.flac', '.ogg', '.aif', '.aiff', '.m4a'}
+    is_visual_media = is_image or is_video
+    if is_visual_media:
         run_ocr = st.checkbox(
             'Extract text from image/video frames and screen it for phishing (downloads OCR weights on first use)',
             value=True,
             key='run_media_ocr',
         )
-        if uploaded_file is not None:
-            extension = os.path.splitext(uploaded_file.name)[1].lower()
-            is_image = extension in {
-                '.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff',
-            }
-            is_video = extension in {'.mp4', '.mov', '.avi', '.mkv', '.webm'}
-            is_audio = extension in {'.wav', '.flac', '.ogg', '.aif', '.aiff', '.m4a'}
-            is_visual_media = is_image or is_video
-            model_label = (
-                'Run experimental deepfake image classifier (downloads about 355 MiB on first use)'
-                if is_image else
-                'Run experimental deepfake video classifier on sampled frames (downloads about 355 MiB on first use)'
-                if is_video else
-                'Run experimental deepfake audio classifier (downloads about 360 MiB on first use)'
-                if is_audio
-                else 'Run experimental local classifier (downloads model weights on first use)'
+    else:
+        run_ocr = False
+    if uploaded_file is not None:
+        model_label = (
+            'Run experimental deepfake image classifier (downloads about 355 MiB on first use)'
+            if is_image else
+            'Run experimental deepfake video classifier on sampled frames (downloads about 355 MiB on first use)'
+            if is_video else
+            'Run experimental deepfake audio classifier (downloads about 360 MiB on first use)'
+            if is_audio else
+            'Run experimental local classifier (downloads model weights on first use)'
+        )
+        model_key = (
+            'run_image_classifier' if is_image else
+            'run_video_classifier' if is_video else
+            'run_other_media_classifier'
+        )
+        run_media_models = st.checkbox(
+            model_label,
+            value=should_run_media_classifier_by_default(uploaded_file.name),
+            key=model_key,
+        )
+        if is_visual_media:
+            st.caption(
+                'This experimental classifier estimates synthetic-like imagery; it cannot prove authenticity. '
+                'The first run downloads about 355 MiB and requires internet access.'
             )
-            model_key = (
-                'run_image_classifier' if is_image else
-                'run_video_classifier' if is_video else
-                'run_other_media_classifier'
+        elif is_audio:
+            st.caption(
+                'This experimental Wav2Vec2 classifier estimates AI-generated versus human speech. '
+                'It analyzes at most the first 20 seconds. The first model load downloads about 360 MiB '
+                'and may take a few minutes on CPU; it cannot prove authenticity.'
             )
-            run_media_models = st.checkbox(
-                model_label,
-                value=should_run_media_classifier_by_default(uploaded_file.name),
-                key=model_key,
-            )
-            if is_visual_media:
-                st.caption(
-                    'This experimental classifier estimates synthetic-like imagery; it cannot prove authenticity. '
-                    'The first run downloads about 355 MiB and requires internet access.'
-                )
-            elif is_audio:
-                st.caption(
-                    'This experimental Wav2Vec2 classifier estimates AI-generated versus human speech. '
-                    'It analyzes at most the first 20 seconds. The first model load downloads about 360 MiB '
-                    'and may take a few minutes on CPU; it cannot prove authenticity.'
-                )
-        else:
-            run_media_models = False
-        if st.button('Inspect file', type='primary', disabled=uploaded_file is None):
-            if uploaded_file is not None:
-                data = uploaded_file.getvalue()
-                if run_media_models:
-                    with st.spinner('Loading the local classifier and analyzing this file...'):
-                        media_report = media_metadata(
-                            data,
-                            uploaded_file.name,
-                            uploaded_file.type or '',
-                            run_ocr=run_ocr,
-                            run_models=True,
-                        )
-                else:
-                    media_report = media_metadata(
-                        data,
-                        uploaded_file.name,
-                        uploaded_file.type or '',
-                        run_ocr=run_ocr,
-                        run_models=False,
-                    )
-                report_start = time.perf_counter()
-                render_report(media_report)
-                media_report['report_generation_time_seconds'] = round(
-                    time.perf_counter() - report_start, 6
-                )
-                media_report['total_processing_time_seconds'] = round(
-                    media_report['analysis_time_seconds'] + media_report['report_generation_time_seconds'], 6
-                )
-                st.session_state.media_report = media_report
+    else:
+        run_media_models = False
 
-        media_report = st.session_state.get('media_report')
-        if media_report:
-            st.text(f"File: {media_report['filename']}")
-            st.text(f"Type: {media_report.get('media_type', 'unknown')}")
-            st.text(f"Size: {media_report['size_mib']} MiB")
-            if media_report.get('inspection_error'):
-                st.error('File inspection failed; details are included in the JSON report.')
-                st.text(media_report['inspection_error'])
-            for error_key, title in (
-                ('ocr_error', 'OCR could not run'),
-                ('deepfake_model_error', 'Experimental media model could not run'),
-                ('phishing_model_error', 'Experimental email model could not run'),
-                ('qr_detection_error', 'QR code detection could not run'),
-                ('video_inspection_error', 'Video could not be inspected'),
-            ):
-                if media_report.get(error_key):
-                    st.error(f"{title}: {media_report[error_key]}")
-            if media_report.get('qr_payloads'):
-                st.subheader('Decoded QR payloads (not opened)')
-                for payload in media_report['qr_payloads']:
-                    st.code(payload, language=None)
-            if media_report.get('ocr', {}).get('text'):
-                st.subheader('Text found by OCR')
-                st.text(media_report['ocr']['text'])
-            for analysis_key, heading, metric_label in (
-                ('email_analysis', 'Email screening', 'Email rule score'),
-                ('ocr_email_analysis', 'OCR phishing screening', 'OCR text rule score'),
-                ('qr_email_analysis', 'QR payload screening', 'QR payload rule score'),
-            ):
-                email_analysis = media_report.get(analysis_key, {})
-                if email_analysis:
-                    st.subheader(heading)
-                    st.metric(
-                        metric_label,
-                        f"{email_analysis['risk_score']} / 100",
-                        email_analysis['risk_level'],
-                    )
-                    for finding in email_analysis['findings']:
-                        st.text(f"{finding['indicator']} (+{finding['points']})")
-                    if email_analysis['urls_found']:
-                        st.caption('URLs extracted from the message are listed only and are never opened.')
-                        for url in email_analysis['urls_found']:
-                            st.code(url, language=None)
-                    for recommendation in email_analysis.get('recommendations', []):
-                        st.markdown(f'- {recommendation}')
-            if media_report.get('experimental_ai_classification'):
-                classification = media_report['experimental_ai_classification']
-                probability = classification.get(
-                    'fake_probability',
-                    classification.get('phishing_probability'),
+    if st.button(
+        'Inspect file',
+        type='primary',
+        disabled=uploaded_file is None,
+        key='inspect_file',
+    ) and uploaded_file is not None:
+        try:
+            validate_upload_size(uploaded_file.name, uploaded_file.size)
+            with st.spinner('Inspecting the file...'):
+                media_report = media_metadata(
+                    uploaded_file.getvalue(),
+                    uploaded_file.name,
+                    uploaded_file.type or '',
+                    run_ocr=run_ocr,
+                    run_models=run_media_models,
                 )
-                if probability is not None:
-                    st.metric(
-                        'Experimental model score',
-                        classification['model_estimate'],
-                        f"{probability:.1%} model score",
-                    )
-                    st.caption(classification['limitations'])
-            if media_report.get('experimental_phishing_classification'):
-                classification = media_report['experimental_phishing_classification']
-                st.metric(
-                    'Experimental email model estimate',
-                    classification['model_estimate'],
-                    f"{classification['phishing_probability']:.1%} phishing-like probability",
-                )
-                st.caption(classification['limitations'])
-            if media_report.get('experimental_frame_classification'):
-                classification = media_report['experimental_frame_classification']
-                st.metric(
-                    'Experimental sampled-frame score',
-                    f"{classification['mean_fake_probability']:.1%} synthetic-like",
-                    f"{classification['sample_count']} frames sampled",
-                )
-                st.caption(classification['limitations'])
-            if media_report.get('logo_detection_status'):
-                st.caption(
-                    f"Logo similarity: {media_report['logo_detection_status']} "
-                    f"({media_report.get('known_logo_count', 0)} reference logos)"
-                )
-            if media_report.get('media_type') == 'image':
-                if media_report.get('experimental_ai_classification'):
-                    st.success('Experimental AI image classification completed.')
-                elif media_report.get('deepfake_model_error'):
-                    st.error(
-                        'AI image classification failed; no synthetic-media estimate is available. '
-                        'See the model error above and retry after checking network access/model setup.'
-                    )
-                else:
-                    st.warning(
-                        'No AI deepfake estimate was produced. Enable the experimental image classifier '
-                        'before inspecting the file.'
-                    )
-                if media_report.get('logo_detection_status') == 'no known logo references configured':
-                    st.info('Copied-logo matching is inactive because no reference logos are configured.')
-            elif media_report.get('media_type') == 'audio':
-                if media_report.get('experimental_ai_classification'):
-                    st.success('Experimental AI audio classification completed.')
-                elif media_report.get('deepfake_model_error'):
-                    st.error(
-                        'AI audio classification failed; no synthetic-audio estimate is available. '
-                        'See the model error above and check network access/model setup.'
-                    )
-                else:
-                    st.warning(
-                        'No AI audio estimate was produced. Enable the experimental audio classifier '
-                        'before inspecting the file.'
-                    )
-            render_integrity_status(media_report.get('integrity_verified', False))
-            st.subheader('Recommendations')
-            for recommendation in media_report.get('recommendations', []):
-                st.markdown(f'- {recommendation}')
-            st.info(media_report['warning'])
-            if 'email_analysis' in media_report:
-                st.subheader('Email text findings')
-                st.text(
-                    f"Risk score: {media_report['email_analysis']['risk_score']} / 100 — "
-                    f"{media_report['email_analysis']['risk_level']}"
-                )
-                for finding in media_report['email_analysis']['findings']:
-                    st.text(f"{finding['indicator']} (+{finding['points']})")
-            st.json(media_report)
-            st.download_button(
-                'Download media inspection report (JSON)',
-                data=render_report(media_report),
-                file_name='media_inspection_report.json',
-                mime='application/json'
+            report_start = time.perf_counter()
+            render_report(media_report)
+            media_report['report_generation_time_seconds'] = round(
+                time.perf_counter() - report_start, 6
             )
+            media_report['total_processing_time_seconds'] = round(
+                media_report['analysis_time_seconds']
+                + media_report['report_generation_time_seconds'],
+                6,
+            )
+            st.session_state.media_report = media_report
+        except UploadValidationError as validation_error:
+            st.error(str(validation_error))
+
+    media_report = st.session_state.get('media_report')
+    if not media_report:
+        return
+    st.text(f"File: {media_report['filename']}")
+    st.text(f"Type: {media_report.get('media_type', 'unknown')}")
+    st.text(f"Size: {media_report['size_mib']} MiB")
+    if media_report.get('inspection_error'):
+        st.error('File inspection failed; details are included in the JSON report.')
+        st.text(media_report['inspection_error'])
+    for error_key, error_title in (
+        ('ocr_error', 'OCR could not run'),
+        ('deepfake_model_error', 'Experimental media model could not run'),
+        ('phishing_model_error', 'Experimental email model could not run'),
+        ('qr_detection_error', 'QR code detection could not run'),
+        ('video_inspection_error', 'Video could not be inspected'),
+    ):
+        if media_report.get(error_key):
+            st.error(f"{error_title}: {media_report[error_key]}")
+    if media_report.get('qr_payloads'):
+        st.subheader('Decoded QR payloads (not opened)')
+        for payload in media_report['qr_payloads']:
+            st.code(payload, language=None)
+    if media_report.get('ocr', {}).get('text'):
+        st.subheader('Text found by OCR')
+        st.text(media_report['ocr']['text'])
+    for analysis_key, heading, metric_label in (
+        ('email_analysis', 'Email screening', 'Email rule score'),
+        ('ocr_email_analysis', 'OCR phishing screening', 'OCR text rule score'),
+        ('qr_email_analysis', 'QR payload screening', 'QR payload rule score'),
+    ):
+        email_analysis = media_report.get(analysis_key, {})
+        if email_analysis:
+            st.subheader(heading)
+            st.metric(
+                metric_label,
+                f"{email_analysis['risk_score']} / 100",
+                email_analysis['risk_level'],
+            )
+            for finding in email_analysis['findings']:
+                st.text(f"{finding['indicator']} (+{finding['points']})")
+            if email_analysis['urls_found']:
+                st.caption('URLs extracted from the message are listed only and are never opened.')
+                for url in email_analysis['urls_found']:
+                    st.code(url, language=None)
+            for recommendation in email_analysis.get('recommendations', []):
+                st.markdown(f'- {recommendation}')
+    if media_report.get('experimental_ai_classification'):
+        classification = media_report['experimental_ai_classification']
+        probability = classification.get(
+            'fake_probability',
+            classification.get('phishing_probability'),
+        )
+        if probability is not None:
+            st.metric(
+                'Experimental model score',
+                classification['model_estimate'],
+                f"{probability:.1%} model score",
+            )
+            st.caption(classification['limitations'])
+    if media_report.get('experimental_phishing_classification'):
+        classification = media_report['experimental_phishing_classification']
+        st.metric(
+            'Experimental email model estimate',
+            classification['model_estimate'],
+            f"{classification['phishing_probability']:.1%} phishing-like probability",
+        )
+        st.caption(classification['limitations'])
+    if media_report.get('experimental_frame_classification'):
+        classification = media_report['experimental_frame_classification']
+        st.metric(
+            'Experimental sampled-frame score',
+            f"{classification['mean_fake_probability']:.1%} synthetic-like",
+            f"{classification['sample_count']} frames sampled",
+        )
+        st.caption(classification['limitations'])
+    if media_report.get('logo_detection_status'):
+        st.caption(
+            f"Logo similarity: {media_report['logo_detection_status']} "
+            f"({media_report.get('known_logo_count', 0)} reference logos)"
+        )
+    if media_report.get('media_type') == 'image':
+        if media_report.get('experimental_ai_classification'):
+            st.success('Experimental AI image classification completed.')
+        elif media_report.get('deepfake_model_error'):
+            st.error(
+                'AI image classification failed; no synthetic-media estimate is available. '
+                'See the model error above and retry after checking network access/model setup.'
+            )
+        else:
+            st.warning(
+                'No AI deepfake estimate was produced. Enable the experimental image classifier '
+                'before inspecting the file.'
+            )
+        if media_report.get('logo_detection_status') == 'no known logo references configured':
+            st.info('Copied-logo matching is inactive because no reference logos are configured.')
+    elif media_report.get('media_type') == 'audio':
+        if media_report.get('experimental_ai_classification'):
+            st.success('Experimental AI audio classification completed.')
+        elif media_report.get('deepfake_model_error'):
+            st.error(
+                'AI audio classification failed; no synthetic-audio estimate is available. '
+                'See the model error above and check network access/model setup.'
+            )
+        else:
+            st.warning(
+                'No AI audio estimate was produced. Enable the experimental audio classifier '
+                'before inspecting the file.'
+            )
+    render_integrity_status(media_report.get('integrity_verified', False))
+    st.subheader('Recommendations')
+    for recommendation in media_report.get('recommendations', []):
+        st.markdown(f'- {recommendation}')
+    st.info(media_report['warning'])
+    st.json(privacy_safe_report(media_report))
+    st.download_button(
+        'Download file inspection report (JSON)',
+        data=render_report(media_report),
+        file_name='media_inspection_report.json',
+        mime='application/json',
+    )
+
+
+def run_app():
+    if not PUBLIC_DEPLOYMENT and not is_loopback_bind_address(st.get_option('server.address')):
+        st.error(
+            'Local-only mode is required. Set Streamlit server.address to 127.0.0.1 '
+            'and restart; non-loopback listeners are not supported.'
+        )
+        st.stop()
+    if PUBLIC_DEPLOYMENT and not is_https_url(PORTAL_CHAT_URL):
+        st.error('Public deployment requires PORTAL_CHAT_URL to use HTTPS.')
+        st.stop()
+    st.set_page_config(page_title='AI Phishing & Deepfake Detector', page_icon='🔍', layout='wide')
+    session_token = st.query_params.get('session')
+    if not isinstance(session_token, str) or not session_token:
+        st.error(
+            'Sign in through the hosted Threat Analysis app before opening the detector.'
+            if PUBLIC_DEPLOYMENT else
+            'Sign in through the Local-First Threat Analysis app before opening the detector.'
+        )
+        st.link_button('Go to sign in', PORTAL_CHAT_URL)
+        st.stop()
+    try:
+        portal_session = portal_session_request('validate', session_token)
+    except RuntimeError as error:
+        st.error(str(error))
+        st.link_button('Return to sign in', PORTAL_CHAT_URL)
+        st.stop()
+    if not portal_session or not portal_session.get('success'):
+        st.error('Your app session is invalid or expired. Sign in again to continue.')
+        st.link_button('Return to sign in', PORTAL_CHAT_URL)
+        st.stop()
+
+    with open(os.path.join(APP_ROOT, 'static', 'cybersecurity.css'), encoding='utf-8') as stylesheet:
+        st.markdown(f'<style>{stylesheet.read()}</style>', unsafe_allow_html=True)
+    st.sidebar.markdown(
+        f'<div class="dashboard-brand"><span>{"HOSTED" if PUBLIC_DEPLOYMENT else "LOCAL-FIRST"}</span>'
+        '<strong>THREAT ANALYSIS</strong></div>',
+        unsafe_allow_html=True,
+    )
+    st.sidebar.caption('WORKSPACE')
+    section = st.sidebar.radio(
+        'Workspace',
+        ['Overview', 'Email', 'Media', 'Files', 'Chat', 'About'],
+        key='dashboard_section',
+        label_visibility='collapsed',
+        on_change=clear_media_report,
+    )
+    media_category = None
+    if section == 'Media':
+        st.sidebar.caption('MEDIA TYPE')
+        media_category = st.sidebar.radio(
+            'Media type',
+            ['Audios', 'Images', 'Videos'],
+            key='dashboard_media_category',
+            label_visibility='collapsed',
+            on_change=clear_media_report,
+        )
+    st.sidebar.divider()
+    st.sidebar.markdown('**SESSION**' if PUBLIC_DEPLOYMENT else '**LOCAL SESSION**')
+    st.sidebar.caption(f"Signed in as {portal_session['username']}")
+    st.sidebar.caption(
+        'Analysis runs on the detector service.' if PUBLIC_DEPLOYMENT
+        else 'Analysis runs on this device.'
+    )
+    st.sidebar.link_button(
+        'App choices and chat',
+        PORTAL_CHAT_URL,
+        use_container_width=True,
+    )
+    if st.sidebar.button('Sign out', use_container_width=True):
+        try:
+            revoked_session = portal_session_request('revoke', session_token)
+        except RuntimeError as error:
+            st.sidebar.error(str(error))
+        else:
+            if revoked_session and revoked_session.get('success'):
+                st.query_params.clear()
+                st.rerun()
+            st.sidebar.error(
+                (revoked_session or {}).get('error', 'Could not end the app session.')
+            )
+
+    st.markdown(
+        '<div class="dashboard-eyebrow">SECURITY WORKSPACE / ANALYSIS</div>'
+        '<h1 class="dashboard-title">Phishing &amp; deepfake analysis</h1>'
+        '<p class="dashboard-description">Review suspicious email, media, and files in one analysis workspace.</p>',
+        unsafe_allow_html=True,
+    )
+    if section == 'Overview':
+        email_report = st.session_state.get('email_report')
+        media_report = st.session_state.get('media_report')
+        latest_email = (
+            f"{email_report['analysis']['risk_score']} / 100"
+            if email_report else 'Waiting for analysis'
+        )
+        latest_file = (
+            media_report.get('media_type', 'File').title()
+            if media_report else 'Waiting for inspection'
+        )
+        status_columns = st.columns(3)
+        status_columns[0].metric('Email screening', latest_email)
+        status_columns[1].metric('Media & files', latest_file)
+        status_columns[2].metric(
+            'Workspace',
+            'Hosted' if PUBLIC_DEPLOYMENT else 'Local',
+            'Session verified',
+        )
+        st.markdown('### Analysis services')
+        service_columns = st.columns(2)
+        with service_columns[0]:
+            st.markdown(
+                '<div class="service-card"><span class="service-state">READY</span>'
+                '<h3>Email</h3><p>Screen sender details, message wording, and suspicious links.</p></div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                '<div class="service-card"><span class="service-state">READY</span>'
+                '<h3>Media</h3><p>Inspect audio, images, and video with optional local models.</p></div>',
+                unsafe_allow_html=True,
+            )
+        with service_columns[1]:
+            st.markdown(
+                '<div class="service-card"><span class="service-state">READY</span>'
+                '<h3>Files</h3><p>Inspect supported TXT, EML, image, audio, and video evidence.</p></div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                '<div class="service-card"><span class="service-state">AVAILABLE</span>'
+                '<h3>Encrypted chat</h3><p>Open the separate end-to-end encrypted chat workspace.</p></div>',
+                unsafe_allow_html=True,
+            )
+        st.caption(
+            'Scores and model outputs are triage signals only. A low score does not prove a message or file is safe.'
+        )
+    elif section == 'Email':
+        render_email_workspace()
+    elif section == 'Media':
+        media_types = {
+            'Audios': ['wav', 'flac', 'ogg', 'aif', 'aiff', 'm4a'],
+            'Images': ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'tif', 'tiff'],
+            'Videos': ['mp4', 'mov', 'avi', 'mkv', 'webm'],
+        }
+        category_title = media_category.rstrip('s').title()
+        render_file_workspace(
+            f'Inspect {category_title.lower()}',
+            f'media_{media_category.lower()}_file',
+            media_types[media_category],
+        )
+    elif section == 'Files':
+        render_file_workspace(
+            'Inspect a file',
+            'general_file',
+            [
+                'txt', 'eml', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tif', 'tiff',
+                'wav', 'flac', 'ogg', 'aif', 'aiff', 'm4a',
+                'mp4', 'mov', 'avi', 'mkv', 'webm',
+            ],
+        )
+    elif section == 'Chat':
+        st.markdown(
+            f'<div class="service-card"><span class="service-state">'
+            f'{"HOSTED" if PUBLIC_DEPLOYMENT else "LOCAL"}</span>'
+            '<h3>End-to-end encrypted chat</h3>'
+            '<p>Continue to your signed-in chat portal to open encrypted conversations.</p></div>',
+            unsafe_allow_html=True,
+        )
+        st.link_button('Open end-to-end encrypted chat', PORTAL_CHAT_URL, type='primary')
+        st.caption('Chat opens in the portal. Your detector sign-in session remains active.')
+    else:
+        render_project_evidence()
 
 if __name__ == '__main__':
     run_app()
