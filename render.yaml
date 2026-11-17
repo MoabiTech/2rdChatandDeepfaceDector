@@ -15,7 +15,10 @@ services:
       - key: E2EE_CHAT_SECRET_KEY
         generateValue: true
       - key: DETECTOR_URL
-        sync: false
+        fromService:
+          name: ai-chat-detector
+          type: web
+          envVarKey: RENDER_EXTERNAL_URL
   - type: web
     name: ai-chat-detector
     runtime: python
@@ -25,6 +28,9 @@ services:
     healthCheckPath: /
     envVars:
       - key: PORTAL_CHAT_URL
-        sync: false
+        fromService:
+          name: ai-chat-detector-chat
+          type: web
+          envVarKey: RENDER_EXTERNAL_URL
       - key: PUBLIC_DEPLOYMENT
         value: "true"

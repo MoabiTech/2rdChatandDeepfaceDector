@@ -225,7 +225,7 @@ def detector_entry_url():
         )
     ):
         raise RuntimeError('DETECTOR_URL must use HTTPS except for a loopback development URL.')
-    return detector_url
+    return parsed._replace(path=f'{parsed.path.rstrip("/")}/').geturl()
 
 
 @app.route('/')

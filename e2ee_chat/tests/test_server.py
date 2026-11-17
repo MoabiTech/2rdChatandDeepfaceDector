@@ -76,7 +76,7 @@ class ChatRelayTests(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     def test_detector_entry_url_requires_https_for_remote_hosts(self):
-        with patch.dict('os.environ', {'DETECTOR_URL': 'https://detector.example.test/'}):
+        with patch.dict('os.environ', {'DETECTOR_URL': 'https://detector.example.test'}):
             self.assertEqual(
                 server.detector_entry_url(),
                 'https://detector.example.test/',

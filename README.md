@@ -29,15 +29,11 @@ service for development; the combined sign-in flow requires both services.
 ## Optional Render deployment
 
 The `render.yaml` Blueprint defines two public Render web services: the
-Streamlit detector and the E2EE chat relay. Deploy the Blueprint from this
-repository in Render, then set the cross-service URLs:
-
-1. In the **ai-chat-detector** service, set `PORTAL_CHAT_URL` to the HTTPS URL
-   of **ai-chat-detector-chat**.
-2. In **ai-chat-detector-chat**, set `DETECTOR_URL` to the HTTPS URL of
-   **ai-chat-detector**, including the trailing slash.
-3. Redeploy both services, then open the chat service, create an account, and
-   launch **Detector** from the signed-in app choices. Both URLs must use HTTPS.
+Streamlit detector and the E2EE chat relay. The Blueprint automatically connects
+the services using each service's `RENDER_EXTERNAL_URL`; the chat normalizes
+`DETECTOR_URL` to include a trailing slash. Deploy the Blueprint from this
+repository in Render, then open the chat service, create an account, and launch
+**Detector** from the signed-in app choices. Both URLs must use HTTPS.
 
 Both services use Render's free plan. SQLite is stored at
 `/tmp/chat_users.sqlite3`, which is ephemeral: accounts, public keys, and
